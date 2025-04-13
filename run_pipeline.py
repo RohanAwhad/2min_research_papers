@@ -1,14 +1,9 @@
 import asyncio
 import os
-import json
 from datetime import datetime, timedelta
 import arxiv
 import pytz
-from typing import List, Tuple, Optional
-
-# Load environment variables first
-from dotenv import load_dotenv
-load_dotenv()
+from typing import List, Optional
 
 # Configure logging and settings
 from src.config.settings import settings
@@ -26,18 +21,18 @@ from src.pipeline.steps.store_redis import store_results_in_redis
 async def fetch_papers(target_date: datetime, categories: List[str]) -> List[ArxivPaper]:
     """Fetches papers from arXiv for a specific date and categories."""
     # Calculate date range
-    end_date = target_date.replace(tzinfo=pytz.UTC)
-    start_date = end_date - timedelta(days=10)
+    end_date: datetime = target_date.replace(tzinfo=pytz.UTC)
+    start_date: datetime = end_date - timedelta(days=10)
     
     logger.info(f"Fetching papers between {start_date} and {end_date}")
     
-    papers = []
-    client = arxiv.Client()
+    papers: List[ArxivPaper] = []
+    client: arxiv.Client = arxiv.Client()
 
     for category in categories:
         try:
             # Create search query for each category
-            search = arxiv.Search(
+            search: arxiv.Search = arxiv.Search(
                 query=f'cat:{category}',
                 max_results=settings.max_results_per_category,
                 sort_by=arxiv.SortCriterion.SubmittedDate,
@@ -45,11 +40,11 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
             )
 
             # Run client.results in a separate thread as it's synchronous blocking IO
-            results = await asyncio.to_thread(lambda: list(client.results(search)))
+            results: List[arxiv.Result] = await asyncio.to_thread(lambda: list(client.results(search)))
 
             # Filter results by date and convert to ArxivPaper objects
             for result in results:
-                published_date = result.published.replace(tzinfo=pytz.UTC)
+                published_date: datetime = result.published.replace(tzinfo=pytz.UTC)
                 if start_date <= published_date <= end_date:
                     papers.append(ArxivPaper(
                         entry_id=result.entry_id,
@@ -70,11 +65,51 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
     return papers
 
 
+async def process_summary(paper: ArxivPaper, extraction_result: ExtractionResult) -> Optional[SummarizationResult]:
+    """Generates, stores, and prints a summary for a single paper."""
+    try:
+        summarization_results: List[SummarizationResult] = await generate_summaries_for_papers([extraction_result])
+        
+        if not summarization_results or summarization_results[0].summary is None:
+            logger.warning(f"Failed to generate summary for {paper.arxiv_id}")
+            return None
+
+        summary_result: SummarizationResult = summarization_results[0]
+        if summary_result.summary is None: raise Exception('summary is None')
+
+        # Store the result in Redis immediately
+        await store_results_in_redis([summary_result])
+        logger.info(f"Stored summary for {paper.arxiv_id} in Redis.")
+
+        # Print the summary immediately
+        print("\n" + "="*80)
+        print(f"Generated Summary for {paper.published_date.isoformat()}")
+        print("="*80)
+        
+        print(f"\n--- Summary ---")
+        print(f"Paper:     {paper.title} ({paper.arxiv_id})")
+        print(f"Published: {paper.published_date.isoformat()}")
+        print(f"Source:    {summary_result.source_type}")
+        print(f"LLM:       {settings.llm_model_name}")
+        print("-" * 20 + " Summary Content " + "-"*20)
+        print(f"Problem:\n{summary_result.summary.problem}\n")
+        print(f"Solution:\n{summary_result.summary.solution}\n")
+        print(f"Results:\n{summary_result.summary.results}\n")
+        print("-" * 57) # Match width of content line
+        print("="*80)
+
+        return summary_result
+
+    except Exception as e:
+        logger.error(f"Error processing summary for {paper.arxiv_id}: {e}", exc_info=True)
+        return None
+
+
 async def run_pipeline():
     """Runs the full arXiv paper processing pipeline."""
     logger.info("--- Starting arXiv Paper Summarization Pipeline ---")
 
-    target_date = datetime.now(pytz.UTC) - timedelta(days=1)
+    target_date: datetime = datetime.now(pytz.UTC) - timedelta(days=1)
     logger.info(f"Target Date: {target_date.date().isoformat()}")
     logger.info(f"Target Categories: {settings.arxiv_categories}")
     logger.info(f"LLM Model: {settings.llm_model_name}")
@@ -84,7 +119,7 @@ async def run_pipeline():
     all_papers: List[ArxivPaper] = []
     download_results: List[DownloadResult] = []
     extraction_results: List[ExtractionResult] = []
-    summarization_results: List[SummarizationResult] = []
+    # summarization_results: List[SummarizationResult] = [] # Removed because processing happens immediately
 
     try:
         # --- 1. Fetch Papers ---
@@ -98,8 +133,8 @@ async def run_pipeline():
         logger.info(f"--- Step 2: Downloading PDFs for {len(all_papers)} Papers ---")
         download_results = await download_all_pdfs(all_papers)
         # Filter out papers that failed download for subsequent steps
-        successful_downloads = [res for res in download_results if res.file_path is not None]
-        failed_downloads = len(download_results) - len(successful_downloads)
+        successful_downloads: List[DownloadResult] = [res for res in download_results if res.file_path is not None]
+        failed_downloads: int = len(download_results) - len(successful_downloads)
         if failed_downloads > 0:
              logger.warning(f"{failed_downloads} paper(s) failed to download.")
         if not successful_downloads:
@@ -108,62 +143,32 @@ async def run_pipeline():
 
         # --- 3. Extract Text ---
         logger.info(f"--- Step 3: Extracting Text from {len(successful_downloads)} PDFs ---")
-        extraction_results = await extract_text_for_papers(successful_downloads)
-        successful_extractions = [res for res in extraction_results if res.text is not None]
-        failed_extractions = len(extraction_results) - len(successful_extractions)
+        extraction_results = await extract_text_for_papers(successful_downloads[:1])
+        successful_extractions: List[ExtractionResult] = [res for res in extraction_results if res.text is not None]
+        failed_extractions: int = len(extraction_results) - len(successful_extractions)
         if failed_extractions > 0:
              logger.warning(f"{failed_extractions} paper(s) failed text extraction.")
         if not successful_extractions:
              logger.warning("No text successfully extracted. Cannot proceed.")
              return
 
-        # --- 4. Generate Summaries ---
-        logger.info(f"--- Step 4: Generating Summaries for {len(successful_extractions)} Papers ---")
-        summarization_results = await generate_summaries_for_papers(successful_extractions)
-        successful_summaries = [res for res in summarization_results if res.summary is not None]
-        failed_summaries = len(summarization_results) - len(successful_summaries)
-        if failed_summaries > 0:
-             logger.warning(f"{failed_summaries} paper(s) failed summarization.")
-        if not successful_summaries:
-             logger.warning("No summaries successfully generated. Nothing to store or print.")
-             return
-
-        # --- 5. Store Results ---
-        logger.info(f"--- Step 5: Storing {len(successful_summaries)} Results in Redis ---")
-        await store_results_in_redis(successful_summaries)
-        logger.success("Results stored in Redis.")
-
-        # --- 6. Print Summaries ---
-        logger.info("--- Pipeline Finished. Generated Summaries: ---")
-        print("\n" + "="*80)
-        print(f"Generated Summaries for {target_date.date().isoformat()}")
-        print("="*80)
-        summary_count = 0
-        for paper, summary, source_type, error in summarization_results:
-            if summary and not error:
+        # --- 4. Generate and Store Summaries ---
+        logger.info(f"--- Step 4: Generating and Storing Summaries for {len(successful_extractions)} Papers ---")
+        summary_count: int = 0
+        for extraction_result in successful_extractions:
+            paper: ArxivPaper = next(paper for paper in all_papers if paper.arxiv_id == extraction_result.paper.arxiv_id) # Find corresponding paper
+            summary_result: Optional[SummarizationResult] = await process_summary(paper, extraction_result)
+            if summary_result:
                 summary_count += 1
-                print(f"\n--- Summary {summary_count} ---")
-                print(f"Paper:     {paper.title} ({paper.arxiv_id})")
-                print(f"Published: {paper.published_date.isoformat()}")
-                print(f"Source:    {source_type}")
-                print(f"LLM:       {settings.llm_model_name}")
-                print("-" * 20 + " Summary Content " + "-"*20)
-                print(f"Problem:\n{summary.problem}\n")
-                print(f"Solution:\n{summary.solution}\n")
-                print(f"Results:\n{summary.results}\n")
-                print("-" * 57) # Match width of content line
-            else:
-                logger.error(f"Skipping print for {paper.arxiv_id}: Failed at summarization stage. Error: {error}")
 
         if summary_count == 0:
             print("No summaries were successfully generated in this run.")
-        print("="*80)
 
     except Exception as e:
         logger.error(f"An unexpected error occurred during the pipeline execution: {e}", exc_info=True)
 
     finally:
-        # --- 7. Cleanup ---
+        # --- 5. Cleanup ---
         logger.info("--- Cleaning up resources ---")
         # Clean up downloaded PDFs (optional, could be kept for debugging)
         # pdf_files = list(PDF_STORAGE_PATH.glob("*.pdf"))
@@ -187,4 +192,4 @@ if __name__ == "__main__":
     elif not settings.arxiv_categories:
          print("ERROR: ARXIV_CATEGORIES not set in environment or .env file. Please set it (e.g., 'cs.LG,cs.CV').")
     else:
-        asyncio.run(run_pipeline()) 
+        asyncio.run(run_pipeline())

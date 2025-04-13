@@ -1,4 +1,6 @@
-import os
+from dotenv import load_dotenv
+load_dotenv('.env', override=True)
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import List, Optional
@@ -9,6 +11,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore" # Ignore extra fields from env file
     )
+
+    # Observability Configuration
+    LANGFUSE_PUBLIC_KEY: str
+    LANGFUSE_SECRET_KEY: str
 
     # Redis Configuration
     redis_host: str = Field(default="localhost", alias="REDIS_HOST")

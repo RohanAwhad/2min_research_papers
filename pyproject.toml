@@ -20,6 +20,7 @@ dependencies = [
     "aiohttp",
     "aiofiles",
     "pytz>=2025.2",
+    "traceloop-sdk>=0.39.0",
 ]
 
 [project.optional-dependencies]

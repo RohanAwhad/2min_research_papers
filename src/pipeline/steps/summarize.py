@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 import json
 import time
 import os
+from traceloop.sdk.decorators import task
 
 # Use Agent from pydantic_ai
 from pydantic_ai import Agent
@@ -27,7 +28,7 @@ try:
         logger.info("Set GEMINI_API_KEY environment variable from settings.")
 
     # Attempt to initialize the agent
-    llm_agent = Agent(settings.llm_model_name)
+    llm_agent = Agent(settings.llm_model_name, instrument=True)
     logger.info(f"Initialized pydantic-ai Agent with model: {settings.llm_model_name}")
     # Note: Initialization itself might not fail even if API key is bad.
     # The error might only occur during the first agent.run call.
@@ -45,6 +46,7 @@ SummarizationResult = NamedTuple("SummarizationResult", [
     ("error", Optional[str])
 ])
 
+@task()
 async def generate_summary(
     paper: ArxivPaper,
     text_to_summarize: Optional[str],
