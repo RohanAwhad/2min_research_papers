@@ -1,0 +1,43 @@
+[project]
+name = "arxiv-summarizer"
+version = "0.1.0"
+description = "Fetches, summarizes, and stores arXiv papers daily."
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "arxiv==2.1.0",
+    "requests==2.31.0",
+    "PyPDF2==3.0.1",
+    "redis[hiredis]==5.0.4",
+    "python-dotenv==1.0.1",
+    "loguru==0.7.2",
+    # Add specific LLM client library if needed (e.g., google-generativeai)
+    "google-generativeai==0.5.4", # Added Gemini client
+    # "anthropic", # Example for Anthropic
+    # "openai", # Example for OpenAI
+    "pydantic-ai==1.0.0", # Use Agent API
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv] # Configuration for uv
+# You can add uv specific configurations here if needed
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+# Tell Hatch where to find the package files for the wheel
+[tool.hatch.build.targets.wheel]
+include = ["/src"]
+
+[tool.ruff]
+# Ruff linting configurations (optional)
+line-length = 88
+select = ["E", "F", "W", "I", "UP", "N", "B"] # Example selection
+ignore = []
+
+[tool.ruff.format]
+# Ruff formatting configurations (optional)
+quote-style = "double" 
