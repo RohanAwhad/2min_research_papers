@@ -183,6 +183,107 @@ async def store_results_in_redis(
     logger.info("All results stored successfully in Redis.")
     # Note: Redis connection pool is managed globally, no need to close conn here
 
+async def is_paper_data_complete(arxiv_id: str) -> Tuple[bool, dict]:
+    """
+    Checks if all expected data for a paper is present in Redis.
+
+    Args:
+        arxiv_id: The arXiv ID of the paper
+
+    Returns:
+        Tuple of (is_complete, status_dict) where status_dict contains detailed status
+    """
+    redis_conn = await get_redis_connection()
+    paper_key = f"paper:{arxiv_id}"
+    status = {
+        "paper_metadata_exists": False,
+        "date_index_exists": False,
+        "category_indices_exist": False,
+        "has_summaries": False,
+        "summary_count": 0,
+        "categories": []
+    }
+
+    # Check paper metadata
+    metadata = await redis_conn.hgetall(paper_key)
+    if metadata:
+        status["paper_metadata_exists"] = True
+
+        # Check date index
+        date_key = "papers_by_date"
+        date_score = await redis_conn.zscore(date_key, paper_key)
+        status["date_index_exists"] = date_score is not None
+
+        # Check category indices
+        if "categories" in metadata:
+            categories = json.loads(metadata["categories"])
+            status["categories"] = categories
+
+            all_cat_indices_exist = True
+            for category in categories:
+                cat_key = f"papers_in_category:{category}"
+                is_member = await redis_conn.sismember(cat_key, paper_key)
+                if not is_member:
+                    all_cat_indices_exist = False
+                    break
+            status["category_indices_exist"] = all_cat_indices_exist
+
+        # Check summaries
+        summary_index_key = f"summaries_for_paper:{arxiv_id}"
+        summary_keys = await redis_conn.smembers(summary_index_key)
+        summary_count = len(summary_keys)
+        status["summary_count"] = summary_count
+        status["has_summaries"] = summary_count > 0
+
+    # Consider data complete if metadata and indices exist
+    is_complete = (status["paper_metadata_exists"] and
+                  status["date_index_exists"] and
+                  status["category_indices_exist"])
+
+    return is_complete, status
+
+
+async def get_latest_summary(arxiv_id: str) -> Optional[StructuredSummary]:
+    """
+    Retrieves the latest generated summary for a paper identified by arxiv_id.
+
+    Args:
+        arxiv_id: The arXiv ID of the paper
+
+    Returns:
+        The latest StructuredSummary object if found, None otherwise
+    """
+    redis_conn = await get_redis_connection()
+
+    # Get all summaries for this paper
+    summary_index_key = f"summaries_for_paper:{arxiv_id}"
+    summary_keys = await redis_conn.smembers(summary_index_key)
+
+    if not summary_keys:
+        logger.debug(f"No summaries found for paper {arxiv_id}")
+        return None
+
+    latest_summary = None
+    latest_timestamp = 0
+
+    # Find the most recent summary
+    for key in summary_keys:
+        summary_data = await redis_conn.hgetall(key)
+        if not summary_data:
+            continue
+
+        timestamp = int(summary_data.get("generation_timestamp", 0))
+        if timestamp > latest_timestamp:
+            latest_timestamp = timestamp
+            try:
+                summary_content = json.loads(summary_data.get("summary_content", "{}"))
+                latest_summary = StructuredSummary(**summary_content)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Failed to parse summary content for {key}: {e}")
+                continue
+
+    return latest_summary
+
 
 # Example usage (for testing)
 async def main():

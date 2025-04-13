@@ -14,8 +14,8 @@ from src.utils.redis_utils import close_redis_pool # Only need close pool here
 from src.pipeline.steps.fetch_arxiv import ArxivPaper
 from src.pipeline.steps.download_pdf import download_all_pdfs, DownloadResult, PDF_STORAGE_PATH
 from src.pipeline.steps.extract_text import extract_text_for_papers, ExtractionResult
-from src.pipeline.steps.summarize import generate_summaries_for_papers, SummarizationResult, StructuredSummary
-from src.pipeline.steps.store_redis import store_results_in_redis
+from src.pipeline.steps.summarize import generate_summaries_for_papers, SummarizationResult
+from src.pipeline.steps.store_redis import get_latest_summary, store_results_in_redis, is_paper_data_complete
 
 
 async def fetch_papers(target_date: datetime, categories: List[str]) -> List[ArxivPaper]:
@@ -23,9 +23,9 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
     # Calculate date range
     end_date: datetime = target_date.replace(tzinfo=pytz.UTC)
     start_date: datetime = end_date - timedelta(days=10)
-    
+
     logger.info(f"Fetching papers between {start_date} and {end_date}")
-    
+
     papers: List[ArxivPaper] = []
     client: arxiv.Client = arxiv.Client()
 
@@ -68,8 +68,32 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
 async def process_summary(paper: ArxivPaper, extraction_result: ExtractionResult) -> Optional[SummarizationResult]:
     """Generates, stores, and prints a summary for a single paper."""
     try:
+        already_saved = await is_paper_data_complete(paper.arxiv_id)
+        if already_saved:
+            logger.info(f'Summary was already saved for paper:{paper.arxiv_id}')
+            summary_obj = await get_latest_summary(paper.arxiv_id)
+            if summary_obj is not None:
+                # Print the summary immediately
+                print("\n" + "="*80)
+                print(f"Generated Summary for {paper.published_date.isoformat()}")
+                print("="*80)
+
+                print(f"\n--- Summary ---")
+                print(f"Paper:     {paper.title} ({paper.arxiv_id})")
+                print(f"Published: {paper.published_date.isoformat()}")
+                print(f"Source:    {extraction_result.source_type}")
+                print(f"LLM:       {settings.llm_model_name}")
+                print("-" * 20 + " Summary Content " + "-"*20)
+                print(f"Problem:\n{summary_obj.problem}\n")
+                print(f"Solution:\n{summary_obj.solution}\n")
+                print(f"Results:\n{summary_obj.results}\n")
+                print("-" * 57) # Match width of content line
+                print("="*80)
+
+                return SummarizationResult(paper, summary_obj, extraction_result.source_type, None)
+
         summarization_results: List[SummarizationResult] = await generate_summaries_for_papers([extraction_result])
-        
+
         if not summarization_results or summarization_results[0].summary is None:
             logger.warning(f"Failed to generate summary for {paper.arxiv_id}")
             return None
@@ -85,7 +109,7 @@ async def process_summary(paper: ArxivPaper, extraction_result: ExtractionResult
         print("\n" + "="*80)
         print(f"Generated Summary for {paper.published_date.isoformat()}")
         print("="*80)
-        
+
         print(f"\n--- Summary ---")
         print(f"Paper:     {paper.title} ({paper.arxiv_id})")
         print(f"Published: {paper.published_date.isoformat()}")
