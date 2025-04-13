@@ -42,3 +42,4 @@ logs/
 
 # Other
 *.ipynb_checkpoints 
+data/pdfs

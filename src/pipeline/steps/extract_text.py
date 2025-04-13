@@ -1,17 +1,25 @@
 import asyncio
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, NamedTuple
 from PyPDF2 import PdfReader
 from PyPDF2.errors import PdfReadError
 
 from src.pipeline.steps.fetch_arxiv import ArxivPaper
+from src.pipeline.steps.download_pdf import DownloadResult
 from src.utils.logging_config import logger
 
 # Define a minimum expected character count for successful full text extraction
 # This helps filter out cases where PyPDF2 returns almost nothing.
 MIN_EXPECTED_CHARS = 500
 
-async def extract_text_from_pdf(paper: ArxivPaper, pdf_path: Optional[Path]) -> Tuple[ArxivPaper, Optional[str], str, Optional[str]]:
+ExtractionResult = NamedTuple("ExtractionResult", [
+    ("paper", ArxivPaper),
+    ("text", Optional[str]),
+    ("source_type", str), # "full_text_pypdf2", "abstract", or "failed"
+    ("error", Optional[str])
+])
+
+async def extract_text_from_pdf(paper: ArxivPaper, pdf_path: Optional[Path]) -> ExtractionResult:
     """Attempts to extract text from a PDF using PyPDF2.
 
     Args:
@@ -19,15 +27,11 @@ async def extract_text_from_pdf(paper: ArxivPaper, pdf_path: Optional[Path]) -> 
         pdf_path: The Path to the downloaded PDF (or None if download failed).
 
     Returns:
-        A tuple containing:
-        - The original ArxivPaper object.
-        - The extracted text if successful and meets minimum criteria, else None.
-        - The source type ("full_text_pypdf2", "abstract", or "failed").
-        - An error message if extraction failed, else None.
+        An ExtractionResult object.
     """
     if pdf_path is None or not pdf_path.exists():
         logger.warning(f"PDF path not provided or does not exist for {paper.arxiv_id}. Falling back to abstract.")
-        return paper, paper.abstract, "abstract", "PDF not available"
+        return ExtractionResult(paper=paper, text=paper.abstract, source_type="abstract", error="PDF not available")
 
     extracted_text = ""
     error_message = None
@@ -93,17 +97,17 @@ async def extract_text_from_pdf(paper: ArxivPaper, pdf_path: Optional[Path]) -> 
         source_type = "failed"
         error_message = error_message or "Final text content was None."
 
-    return paper, extracted_text, source_type, error_message
+    return ExtractionResult(paper=paper, text=extracted_text, source_type=source_type, error=error_message)
 
 
-async def extract_text_for_papers(download_results: List[Tuple[ArxivPaper, Optional[Path], Optional[str]]]) -> List[Tuple[ArxivPaper, Optional[str], str, Optional[str]]]:
+async def extract_text_for_papers(download_results: List[DownloadResult]) -> List[ExtractionResult]:
     """Extracts text for all papers based on download results."""
-    tasks = [extract_text_from_pdf(paper, pdf_path) for paper, pdf_path, _ in download_results]
-    results = await asyncio.gather(*tasks)
+    tasks = [extract_text_from_pdf(dl_res.paper, dl_res.file_path) for dl_res in download_results]
+    results: List[ExtractionResult] = await asyncio.gather(*tasks)
 
-    successful_extractions = sum(1 for _, text, src, _ in results if text is not None and src == "full_text_pypdf2")
-    fallback_abstract = sum(1 for _, _, src, _ in results if src == "abstract")
-    failed_extractions = sum(1 for _, _, src, _ in results if src == "failed")
+    successful_extractions = sum(1 for res in results if res.text is not None and res.source_type == "full_text_pypdf2")
+    fallback_abstract = sum(1 for res in results if res.source_type == "abstract")
+    failed_extractions = sum(1 for res in results if res.source_type == "failed")
 
     logger.info(f"Text Extraction summary: Successful (PyPDF2)={successful_extractions}, Fallback (Abstract)={fallback_abstract}, Failed={failed_extractions}")
     return results
@@ -157,10 +161,10 @@ async def main():
     logger.info("Starting text extraction test...")
     extraction_results = await extract_text_for_papers(download_results)
 
-    for paper, text, source, error in extraction_results:
-        status = "Success" if text else "Failed"
-        text_preview = (text[:100] + "...") if text else "None"
-        print(f"{status}: {paper.arxiv_id} (Source: {source}) -> Preview: '{text_preview}' | Error: {error}")
+    for result in extraction_results:
+        status = "Success" if result.text else "Failed"
+        text_preview = (result.text[:100] + "...") if result.text else "None"
+        print(f"{status}: {result.paper.arxiv_id} (Source: {result.source_type}) -> Preview: '{text_preview}' | Error: {result.error}")
 
 if __name__ == "__main__":
     asyncio.run(main())

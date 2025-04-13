@@ -13,15 +13,14 @@ class Settings(BaseSettings):
     # Redis Configuration
     redis_host: str = Field(default="localhost", alias="REDIS_HOST")
     redis_port: int = Field(default=6379, alias="REDIS_PORT")
-    redis_password: Optional[str] = Field(default=None, alias="REDIS_PASSWORD")
     redis_db: int = Field(default=0, alias="REDIS_DB")
 
     # LLM API Configuration
     # Add fields for your chosen LLM API keys here, e.g.:
     # openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     # anthropic_api_key: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
-    google_api_key: Optional[str] = Field(default=None, alias="GOOGLE_API_KEY")
-    llm_model_name: str = Field(default="gemini-1.5-pro-latest", alias="LLM_MODEL_NAME") # Default model
+    gemini_api_key: Optional[str] = Field(default=None, alias="GEMINI_API_KEY")
+    llm_model_name: str = Field(default="google-gla:gemini-2.5-pro-exp-03-25", alias="LLM_MODEL_NAME") # Default model
 
     # Pipeline Configuration
     arxiv_categories_str: str = Field(default="cs.LG,cs.CV", alias="ARXIV_CATEGORIES")

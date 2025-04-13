@@ -5,17 +5,28 @@ description = "Fetches, summarizes, and stores arXiv papers daily."
 authors = [{ name = "Your Name", email = "you@example.com" }]
 requires-python = ">=3.10"
 dependencies = [
-    "arxiv==2.1.0",
-    "requests==2.31.0",
-    "PyPDF2==3.0.1",
-    "redis[hiredis]==5.0.4",
-    "python-dotenv==1.0.1",
-    "loguru==0.7.2",
+    "arxiv",
+    "requests",
+    "PyPDF2",
+    "redis[hiredis]",
+    "python-dotenv",
+    "loguru",
     # Add specific LLM client library if needed (e.g., google-generativeai)
-    "google-generativeai==0.5.4", # Added Gemini client
+    "google-generativeai", # Added Gemini client
     # "anthropic", # Example for Anthropic
     # "openai", # Example for OpenAI
-    "pydantic-ai==1.0.0", # Use Agent API
+    "pydantic-ai==0.0.55", # Use Agent API
+    "pydantic-settings",
+    "aiohttp",
+    "aiofiles",
+    "pytz>=2025.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-mock",
 ]
 
 [build-system]

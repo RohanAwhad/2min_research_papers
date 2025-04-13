@@ -38,15 +38,11 @@ async def store_paper_metadata(redis_conn: redis.Redis, paper: ArxivPaper):
         await redis_conn.zadd(date_key, {key: date_score})
         logger.trace(f"Indexed paper {key} in {date_key}")
 
-        # Index by category
-        index_tasks = []
+        # Index by category - do sequentially to avoid event loop issues
         for category in paper.categories:
             cat_key = f"papers_in_category:{category}"
-            index_tasks.append(redis_conn.sadd(cat_key, key))
-            logger.trace(f"Adding paper {key} to category index {cat_key}")
-        if index_tasks:
-            await asyncio.gather(*index_tasks)
-            logger.trace(f"Completed category indexing for paper {key}")
+            await redis_conn.sadd(cat_key, key)
+            logger.trace(f"Added paper {key} to category index {cat_key}")
 
         return True, None
     except Exception as e:
@@ -100,41 +96,92 @@ async def store_results_in_redis(
         return
 
     redis_conn = await get_redis_connection()
+    paper_store_tasks = []
+    # Store original inputs along with tasks to map results back
+    inputs_for_papers = []
+    for paper, summary, source_type, _ in summary_results:
+        paper_store_tasks.append(store_paper_metadata(redis_conn, paper))
+        inputs_for_papers.append((paper, summary, source_type)) # Keep track
+
     paper_success_count = 0
     paper_fail_count = 0
-    summary_success_count = 0
-    summary_fail_count = 0
-
-    logger.info(f"Storing {len(summary_results)} results in Redis...")
-
-    # Store papers first, then summaries
-    paper_store_tasks = []
-    papers_to_summarize = []
-    for paper, summary, source_type, _ in summary_results:
-        # Store paper metadata regardless of summary success (unless already exists? TBD)
-        # For now, let's assume we always try to store/update the paper metadata
-        paper_store_tasks.append(store_paper_metadata(redis_conn, paper))
-        papers_to_summarize.append((paper, summary, source_type))
+    errors = []
+    successful_paper_inputs = [] # Keep track of inputs for successful papers
 
     if paper_store_tasks:
-        paper_results = await asyncio.gather(*paper_store_tasks)
-        paper_success_count = sum(1 for success, _ in paper_results if success)
-        paper_fail_count = len(paper_results) - paper_success_count
+        paper_results = await asyncio.gather(*paper_store_tasks, return_exceptions=True) # Catch potential exceptions
+        for i, result in enumerate(paper_results):
+            paper_input = inputs_for_papers[i] # Get corresponding input
+            paper, _, _ = paper_input
+
+            if isinstance(result, Exception):
+                paper_fail_count += 1
+                error_msg = f"PaperStore Task {paper.arxiv_id} raised: {result}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+            elif isinstance(result, tuple) and len(result) == 2:
+                success, error_msg = result
+                if success:
+                    paper_success_count += 1
+                    successful_paper_inputs.append(paper_input) # Add input to list for summary processing
+                else:
+                    paper_fail_count += 1
+                    if error_msg: errors.append(f"PaperStore {paper.arxiv_id}: {error_msg}")
+            else:
+                # Handle unexpected result format
+                paper_fail_count += 1
+                error_msg = f"PaperStore Task {paper.arxiv_id} returned unexpected result: {result}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+
         logger.info(f"Paper metadata storage: Successful={paper_success_count}, Failed={paper_fail_count}")
 
-    # Now store summaries
+    # Now store summaries ONLY for papers that were stored successfully
     summary_store_tasks = []
-    for paper, summary, source_type in papers_to_summarize:
-        summary_store_tasks.append(store_summary(redis_conn, paper, summary, source_type))
+    summary_success_count = 0
+    summary_fail_count = 0
+    for paper, summary, source_type in successful_paper_inputs: # Iterate only successful ones
+        # Only attempt to store if a summary object actually exists
+        if summary:
+            summary_store_tasks.append(store_summary(redis_conn, paper, summary, source_type))
+        # Else: No summary object was generated OR paper failed, nothing to store
 
     if summary_store_tasks:
-        summary_results_store = await asyncio.gather(*summary_store_tasks)
-        summary_success_count = sum(1 for success, _ in summary_results_store if success)
-        summary_fail_count = len(summary_results_store) - summary_success_count
+        summary_results_store = await asyncio.gather(*summary_store_tasks, return_exceptions=True) # Catch potential exceptions
+        for i, result in enumerate(summary_results_store):
+             # Need to know which paper this result corresponds to - requires careful mapping if needed
+             # For now, just process success/failure counts
+            if isinstance(result, Exception):
+                summary_fail_count += 1
+                # Ideally, associate error back to specific paper/summary ID if possible
+                error_msg = f"SummaryStore Task raised: {result}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+            elif isinstance(result, tuple) and len(result) == 2:
+                success, error_msg = result
+                if success:
+                    summary_success_count += 1
+                else:
+                    summary_fail_count += 1
+                    # Associate error back if possible
+                    if error_msg: errors.append(f"SummaryStore: {error_msg}")
+            else:
+                summary_fail_count += 1
+                error_msg = f"SummaryStore Task returned unexpected result: {result}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+
         logger.info(f"Summary storage: Successful={summary_success_count}, Failed={summary_fail_count}")
 
+    # --- Check for failures and raise exception ---
+    if paper_fail_count > 0 or summary_fail_count > 0:
+        logger.debug(f"Raising RuntimeError. Paper Fail: {paper_fail_count}, Summary Fail: {summary_fail_count}") # Add Debug Log
+        error_summary = f"Redis storage failed for {paper_fail_count} paper(s) and {summary_fail_count} summary(s). Errors: {'; '.join(errors)}"
+        logger.error(error_summary)
+        raise RuntimeError(error_summary)
+
+    logger.info("All results stored successfully in Redis.")
     # Note: Redis connection pool is managed globally, no need to close conn here
-    # await redis_conn.close() # Don't close if using pool
 
 
 # Example usage (for testing)

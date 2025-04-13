@@ -1,7 +1,7 @@
 import asyncio
 import os
 import requests
-from typing import List, Tuple
+from typing import List, Tuple, NamedTuple
 from pathlib import Path
 import aiohttp
 import aiofiles
@@ -13,7 +13,14 @@ from src.utils.logging_config import logger
 PDF_STORAGE_PATH = Path("data/pdfs")
 PDF_STORAGE_PATH.mkdir(parents=True, exist_ok=True) # Ensure directory exists
 
-async def download_pdf(session: aiohttp.ClientSession, paper: ArxivPaper) -> Tuple[ArxivPaper, Path | None, str | None]:
+# Define the structure for download results
+DownloadResult = NamedTuple("DownloadResult", [
+    ("paper", ArxivPaper),
+    ("file_path", Path | None),
+    ("error", str | None)
+])
+
+async def download_pdf(session: aiohttp.ClientSession, paper: ArxivPaper) -> DownloadResult:
     """Downloads a single PDF asynchronously.
 
     Args:
@@ -21,13 +28,11 @@ async def download_pdf(session: aiohttp.ClientSession, paper: ArxivPaper) -> Tup
         paper: The ArxivPaper object.
 
     Returns:
-        A tuple containing:
-        - The original ArxivPaper object.
-        - The Path to the downloaded PDF if successful, else None.
-        - An error message if download failed, else None.
+        A DownloadResult object containing the paper, file path (or None),
+        and error message (or None).
     """
     if not paper.pdf_url:
-        return paper, None, "No PDF URL found in metadata."
+        return DownloadResult(paper=paper, file_path=None, error="No PDF URL found in metadata.")
 
     pdf_url_str = str(paper.pdf_url)
     # Ensure the URL ends with .pdf for consistency, some arXiv URLs might not
@@ -40,7 +45,7 @@ async def download_pdf(session: aiohttp.ClientSession, paper: ArxivPaper) -> Tup
     # Skip download if file already exists
     if file_path.exists() and file_path.stat().st_size > 0:
         logger.trace(f"PDF already exists: {file_path}")
-        return paper, file_path, None
+        return DownloadResult(paper=paper, file_path=file_path, error=None)
 
     try:
         logger.debug(f"Attempting download: {pdf_url_str}")
@@ -62,20 +67,20 @@ async def download_pdf(session: aiohttp.ClientSession, paper: ArxivPaper) -> Tup
                     await f.write(chunk)
 
             logger.info(f"Successfully downloaded: {file_path}")
-            return paper, file_path, None
+            return DownloadResult(paper=paper, file_path=file_path, error=None)
 
     except aiohttp.ClientResponseError as e:
         error_msg = f"HTTP Error {e.status} for {pdf_url_str}: {e.message}"
         logger.error(error_msg)
-        return paper, None, error_msg
+        return DownloadResult(paper=paper, file_path=None, error=error_msg)
     except asyncio.TimeoutError:
         error_msg = f"Timeout downloading {pdf_url_str}"
         logger.error(error_msg)
-        return paper, None, error_msg
+        return DownloadResult(paper=paper, file_path=None, error=error_msg)
     except aiohttp.ClientError as e:
         error_msg = f"Client error downloading {pdf_url_str}: {e}"
         logger.error(error_msg)
-        return paper, None, error_msg
+        return DownloadResult(paper=paper, file_path=None, error=error_msg)
     except Exception as e:
         error_msg = f"Unexpected error downloading {pdf_url_str}: {type(e).__name__} - {e}"
         logger.error(error_msg)
@@ -85,9 +90,9 @@ async def download_pdf(session: aiohttp.ClientSession, paper: ArxivPaper) -> Tup
                 os.remove(file_path)
             except OSError:
                 pass
-        return paper, None, error_msg
+        return DownloadResult(paper=paper, file_path=None, error=error_msg)
 
-async def download_all_pdfs(papers: List[ArxivPaper]) -> List[Tuple[ArxivPaper, Path | None, str | None]]:
+async def download_all_pdfs(papers: List[ArxivPaper]) -> List[DownloadResult]:
     """Downloads PDFs for all papers in the list concurrently."""
     if not papers:
         logger.info("No papers provided for PDF download.")
@@ -95,9 +100,9 @@ async def download_all_pdfs(papers: List[ArxivPaper]) -> List[Tuple[ArxivPaper, 
 
     async with aiohttp.ClientSession() as session:
         tasks = [download_pdf(session, paper) for paper in papers]
-        results = await asyncio.gather(*tasks)
+        results: List[DownloadResult] = await asyncio.gather(*tasks)
 
-    successful_downloads = sum(1 for _, path, _ in results if path is not None)
+    successful_downloads = sum(1 for res in results if res.file_path is not None)
     failed_downloads = len(papers) - successful_downloads
     logger.info(f"PDF Download summary: Successful={successful_downloads}, Failed={failed_downloads}")
     return results
@@ -142,11 +147,11 @@ async def main():
     logger.info("Starting dummy PDF download test...")
     results = await download_all_pdfs(dummy_papers)
 
-    for paper, path, error in results:
-        if path:
-            print(f"Success: {paper.arxiv_id} -> {path}")
+    for result in results:
+        if result.file_path:
+            print(f"Success: {result.paper.arxiv_id} -> {result.file_path}")
         else:
-            print(f"Failed: {paper.arxiv_id} -> Error: {error}")
+            print(f"Failed: {result.paper.arxiv_id} -> Error: {result.error}")
 
 if __name__ == "__main__":
     # Need dummy data imports for testing
