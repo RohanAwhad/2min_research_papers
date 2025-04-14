@@ -22,7 +22,7 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
     """Fetches papers from arXiv for a specific date and categories."""
     # Calculate date range
     end_date: datetime = target_date.replace(tzinfo=pytz.UTC)
-    start_date: datetime = end_date - timedelta(days=10)
+    start_date: datetime = end_date - timedelta(days=1)
 
     logger.info(f"Fetching papers between {start_date} and {end_date}")
 
@@ -167,7 +167,7 @@ async def run_pipeline():
 
         # --- 3. Extract Text ---
         logger.info(f"--- Step 3: Extracting Text from {len(successful_downloads)} PDFs ---")
-        extraction_results = await extract_text_for_papers(successful_downloads[:1])
+        extraction_results = await extract_text_for_papers(successful_downloads)
         successful_extractions: List[ExtractionResult] = [res for res in extraction_results if res.text is not None]
         failed_extractions: int = len(extraction_results) - len(successful_extractions)
         if failed_extractions > 0:
