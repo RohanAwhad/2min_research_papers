@@ -1,10 +1,12 @@
 import asyncio
 import os
 import aiohttp
+import time
 from datetime import datetime, timedelta
 import arxiv
 import pytz
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, TypeVar, Awaitable, Any
+import asyncio.locks
 
 # Configure logging and settings
 from src.config.settings import settings
@@ -17,6 +19,77 @@ from src.pipeline.steps.download_pdf import download_pdf, DownloadResult, PDF_ST
 from src.pipeline.steps.extract_text import extract_text_from_pdf, ExtractionResult
 from src.pipeline.steps.summarize import generate_summary, SummarizationResult, StructuredSummary
 from src.pipeline.steps.store_redis import get_latest_summary, store_results_in_redis, is_paper_data_complete
+
+
+# Type variable for the rate limiter
+T = TypeVar('T')
+
+
+class LeakyBucketRateLimiter:
+    """
+    Implements a leaky bucket rate limiter for limiting asynchronous function calls.
+    """
+    def __init__(self, rate_limit: int, time_period: float = 60.0):
+        """
+        Initialize the rate limiter.
+        
+        Args:
+            rate_limit: Maximum number of operations allowed in the time period
+            time_period: Time period in seconds (default: 60 seconds)
+        """
+        self.rate_limit = rate_limit  # Operations per time period
+        self.time_period = time_period  # Time period in seconds
+        self.token_interval = time_period / rate_limit  # Time between tokens
+        self.last_token_time = time.time()  # Last time a token was added
+        self.tokens = rate_limit  # Start with a full bucket
+        self.lock = asyncio.Lock()  # Lock for thread safety
+        
+        logger.info(f"Rate limiter initialized: {rate_limit} operations per {time_period} seconds "
+                   f"(1 operation every {self.token_interval:.2f} seconds)")
+    
+    async def acquire(self):
+        """
+        Acquire a token from the bucket, waiting if necessary.
+        """
+        async with self.lock:
+            # Calculate how many tokens should have been added since last check
+            current_time = time.time()
+            elapsed = current_time - self.last_token_time
+            tokens_to_add = elapsed / self.token_interval
+            
+            # Add tokens to the bucket (up to max capacity)
+            self.tokens = min(self.rate_limit, self.tokens + tokens_to_add)
+            self.last_token_time = current_time
+            
+            # If we have at least one token, use it immediately
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            
+            # Otherwise, calculate wait time for next token
+            wait_time = self.token_interval - (self.tokens * self.token_interval)
+            logger.debug(f"Rate limit reached. Waiting {wait_time:.2f} seconds for next token.")
+            
+            # Update state as if we had waited
+            self.last_token_time += wait_time
+            self.tokens = 0  # We'll use the token we're waiting for
+            
+            # Actually wait
+            await asyncio.sleep(wait_time)
+    
+    async def rate_limited(self, func: Callable[..., Awaitable[T]], *args, **kwargs) -> T:
+        """
+        Execute a function with rate limiting.
+        
+        Args:
+            func: The async function to call
+            *args, **kwargs: Arguments to pass to the function
+            
+        Returns:
+            The result of the function call
+        """
+        await self.acquire()
+        return await func(*args, **kwargs)
 
 
 async def fetch_papers(target_date: datetime, categories: List[str]) -> List[ArxivPaper]:
@@ -243,10 +316,19 @@ async def run_pipeline():
             logger.warning("No papers found for the target date and categories. Exiting.")
             return
 
-        # --- 2. Process Papers Concurrently ---
-        logger.info(f"--- Step 2: Processing {len(all_papers)} Papers Concurrently ---")
-        # Process all papers concurrently
-        tasks = [process_single_paper_summary(paper) for paper in all_papers]
+        # --- 2. Process Papers with Rate Limiting ---
+        # Create a rate limiter allowing 50 operations per minute
+        rate_limiter = LeakyBucketRateLimiter(rate_limit=50, time_period=60.0)
+        logger.info(f"--- Step 2: Processing {len(all_papers)} Papers with Rate Limiting ({rate_limiter.rate_limit} ops/min) ---")
+        
+        # Create tasks that will be rate limited
+        tasks = []
+        for paper in all_papers:
+            # Wrap each paper processing call with the rate limiter
+            task = rate_limiter.rate_limited(process_single_paper_summary, paper)
+            tasks.append(task)
+            
+        # Execute all tasks and collect results
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Count successful summaries
