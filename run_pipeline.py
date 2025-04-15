@@ -45,6 +45,7 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
             # Filter results by date and convert to ArxivPaper objects
             for result in results:
                 published_date: datetime = result.published.replace(tzinfo=pytz.UTC)
+                logger.debug(f'Published Date: {published_date}')
                 if start_date <= published_date <= end_date:
                     papers.append(ArxivPaper(
                         entry_id=result.entry_id,
@@ -58,7 +59,7 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
                     ))
 
         except Exception as e:
-            logger.error(f"Error fetching papers for category {category}: {e}", exc_info=True)
+            logger.exception(f"Error fetching papers for category {category}: {e}")
             continue
 
     logger.info(f"Fetched {len(papers)} papers published between {start_date.date()} and {end_date.date()}")
@@ -68,14 +69,14 @@ async def fetch_papers(target_date: datetime, categories: List[str]) -> List[Arx
 async def process_summary(paper: ArxivPaper, extraction_result: ExtractionResult) -> Optional[SummarizationResult]:
     """Generates, stores, and prints a summary for a single paper."""
     try:
-        already_saved = await is_paper_data_complete(paper.arxiv_id)
-        if already_saved:
-            logger.info(f'Summary was already saved for paper:{paper.arxiv_id}')
+        has_summary = await is_paper_data_complete(paper.arxiv_id)
+        if has_summary:
+            logger.info(f'Valid summary found for paper:{paper.arxiv_id}')
             summary_obj = await get_latest_summary(paper.arxiv_id)
             if summary_obj is not None:
                 # Print the summary immediately
                 print("\n" + "="*80)
-                print(f"Generated Summary for {paper.published_date.isoformat()}")
+                print(f"Retrieved Summary for {paper.published_date.isoformat()}")
                 print("="*80)
 
                 print(f"\n--- Summary ---")
