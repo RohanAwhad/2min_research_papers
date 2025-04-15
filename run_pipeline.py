@@ -1,20 +1,21 @@
 import asyncio
 import os
+import aiohttp
 from datetime import datetime, timedelta
 import arxiv
 import pytz
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Configure logging and settings
 from src.config.settings import settings
 from src.utils.logging_config import logger
-from src.utils.redis_utils import close_redis_pool # Only need close pool here
+from src.utils.redis_utils import close_redis_pool, get_redis_connection
 
 # Import pipeline components
 from src.pipeline.steps.fetch_arxiv import ArxivPaper
-from src.pipeline.steps.download_pdf import download_all_pdfs, DownloadResult, PDF_STORAGE_PATH
-from src.pipeline.steps.extract_text import extract_text_for_papers, ExtractionResult
-from src.pipeline.steps.summarize import generate_summaries_for_papers, SummarizationResult
+from src.pipeline.steps.download_pdf import download_pdf, DownloadResult, PDF_STORAGE_PATH
+from src.pipeline.steps.extract_text import extract_text_from_pdf, ExtractionResult
+from src.pipeline.steps.summarize import generate_summary, SummarizationResult, StructuredSummary
 from src.pipeline.steps.store_redis import get_latest_summary, store_results_in_redis, is_paper_data_complete
 
 
@@ -130,6 +131,99 @@ async def process_summary(paper: ArxivPaper, extraction_result: ExtractionResult
         return None
 
 
+async def process_single_paper_summary(paper: ArxivPaper) -> Optional[SummarizationResult]:
+    """
+    Fully processes a single paper asynchronously:
+    1. First checks if a summary already exists in Redis
+    2. If no summary exists:
+       a. Downloads the PDF if not already downloaded
+       b. Extracts text from the PDF
+       c. Generates the summary
+       d. Stores the summary in Redis
+    
+    Args:
+        paper: The ArxivPaper object containing metadata
+        
+    Returns:
+        Optional[SummarizationResult]: The summarization result, or None if failed
+    """
+    try:
+        # Step 1: Check if we already have a summary in Redis
+        has_summary = await is_paper_data_complete(paper.arxiv_id)
+        if has_summary:
+            logger.info(f'Valid summary found for paper:{paper.arxiv_id}')
+            summary_obj = await get_latest_summary(paper.arxiv_id)
+            if summary_obj is not None:
+                # Construct a SummarizationResult with the existing summary
+                # We don't know the source_type for existing summaries, so use 'redis_cache'
+                summary_result = SummarizationResult(paper, summary_obj, 'redis_cache', None)
+                # Print the summary
+                print("\n" + "="*80)
+                print(f"Retrieved Summary for {paper.published_date.isoformat()}")
+                print("="*80)
+                print(f"\n--- Summary ---")
+                print(f"Paper:     {paper.title} ({paper.arxiv_id})")
+                print(f"Published: {paper.published_date.isoformat()}")
+                print(f"Source:    redis_cache") 
+                print(f"LLM:       {settings.llm_model_name}")
+                print("-" * 20 + " Summary Content " + "-"*20)
+                print(f"Problem:\n{summary_obj.problem}\n")
+                print(f"Solution:\n{summary_obj.solution}\n")
+                print(f"Results:\n{summary_obj.results}\n")
+                print("-" * 57) # Match width of content line
+                print("="*80)
+                return summary_result
+
+        # Step 2: Download PDF if needed (within a ClientSession context)
+        async with aiohttp.ClientSession() as session:
+            download_result = await download_pdf(session, paper)
+        
+        if not download_result.file_path:
+            logger.warning(f"Failed to download PDF for {paper.arxiv_id}: {download_result.error}")
+            # Continue with abstract if available
+        
+        # Step 3: Extract text from PDF
+        extraction_result = await extract_text_from_pdf(paper, download_result.file_path)
+        
+        if not extraction_result.text:
+            logger.warning(f"Failed to extract text for {paper.arxiv_id}: {extraction_result.error}")
+            return None
+        
+        # Step 4: Generate summary
+        summarization_result = await generate_summary(paper, extraction_result.text, extraction_result.source_type)
+        
+        if not summarization_result or summarization_result.summary is None:
+            logger.warning(f"Failed to generate summary for {paper.arxiv_id}")
+            return None
+        
+        # Step 5: Store in Redis
+        # The function expects a list of tuples: List[Tuple[ArxivPaper, Optional[StructuredSummary], str, Optional[str]]]
+        input_format = [(paper, summarization_result.summary, summarization_result.source_type, summarization_result.error)]
+        await store_results_in_redis(input_format)
+        logger.info(f"Stored summary for {paper.arxiv_id} in Redis.")
+        
+        # Print the summary
+        print("\n" + "="*80)
+        print(f"Generated Summary for {paper.published_date.isoformat()}")
+        print("="*80)
+        print(f"\n--- Summary ---")
+        print(f"Paper:     {paper.title} ({paper.arxiv_id})")
+        print(f"Published: {paper.published_date.isoformat()}")
+        print(f"Source:    {summarization_result.source_type}")
+        print(f"LLM:       {settings.llm_model_name}")
+        print("-" * 20 + " Summary Content " + "-"*20)
+        print(f"Problem:\n{summarization_result.summary.problem}\n")
+        print(f"Solution:\n{summarization_result.summary.solution}\n")
+        print(f"Results:\n{summarization_result.summary.results}\n")
+        print("-" * 57) # Match width of content line
+        print("="*80)
+        
+        return summarization_result
+        
+    except Exception as e:
+        logger.error(f"Error processing summary for {paper.arxiv_id}: {e}", exc_info=True)
+        return None
+
 async def run_pipeline():
     """Runs the full arXiv paper processing pipeline."""
     logger.info("--- Starting arXiv Paper Summarization Pipeline ---")
@@ -141,11 +235,6 @@ async def run_pipeline():
     logger.info(f"Redis Host: {settings.redis_host}:{settings.redis_port}, DB: {settings.redis_db}")
     logger.info(f"PDF Storage Path: {PDF_STORAGE_PATH.resolve()}")
 
-    all_papers: List[ArxivPaper] = []
-    download_results: List[DownloadResult] = []
-    extraction_results: List[ExtractionResult] = []
-    # summarization_results: List[SummarizationResult] = [] # Removed because processing happens immediately
-
     try:
         # --- 1. Fetch Papers ---
         logger.info("--- Step 1: Fetching Papers ---")
@@ -154,38 +243,18 @@ async def run_pipeline():
             logger.warning("No papers found for the target date and categories. Exiting.")
             return
 
-        # --- 2. Download PDFs ---
-        logger.info(f"--- Step 2: Downloading PDFs for {len(all_papers)} Papers ---")
-        download_results = await download_all_pdfs(all_papers)
-        # Filter out papers that failed download for subsequent steps
-        successful_downloads: List[DownloadResult] = [res for res in download_results if res.file_path is not None]
-        failed_downloads: int = len(download_results) - len(successful_downloads)
-        if failed_downloads > 0:
-             logger.warning(f"{failed_downloads} paper(s) failed to download.")
-        if not successful_downloads:
-             logger.warning("No PDFs successfully downloaded. Cannot proceed.")
-             return
-
-        # --- 3. Extract Text ---
-        logger.info(f"--- Step 3: Extracting Text from {len(successful_downloads)} PDFs ---")
-        extraction_results = await extract_text_for_papers(successful_downloads)
-        successful_extractions: List[ExtractionResult] = [res for res in extraction_results if res.text is not None]
-        failed_extractions: int = len(extraction_results) - len(successful_extractions)
-        if failed_extractions > 0:
-             logger.warning(f"{failed_extractions} paper(s) failed text extraction.")
-        if not successful_extractions:
-             logger.warning("No text successfully extracted. Cannot proceed.")
-             return
-
-        # --- 4. Generate and Store Summaries ---
-        logger.info(f"--- Step 4: Generating and Storing Summaries for {len(successful_extractions)} Papers ---")
-        summary_count: int = 0
-        for extraction_result in successful_extractions:
-            paper: ArxivPaper = next(paper for paper in all_papers if paper.arxiv_id == extraction_result.paper.arxiv_id) # Find corresponding paper
-            summary_result: Optional[SummarizationResult] = await process_summary(paper, extraction_result)
-            if summary_result:
-                summary_count += 1
-
+        # --- 2. Process Papers Concurrently ---
+        logger.info(f"--- Step 2: Processing {len(all_papers)} Papers Concurrently ---")
+        # Process all papers concurrently
+        tasks = [process_single_paper_summary(paper) for paper in all_papers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Count successful summaries
+        summary_count = sum(1 for res in results if isinstance(res, SummarizationResult) and res.summary is not None)
+        error_count = sum(1 for res in results if isinstance(res, Exception))
+        
+        logger.info(f"Summary generation results: Success={summary_count}, Errors={error_count}")
+        
         if summary_count == 0:
             print("No summaries were successfully generated in this run.")
 
@@ -193,17 +262,8 @@ async def run_pipeline():
         logger.error(f"An unexpected error occurred during the pipeline execution: {e}", exc_info=True)
 
     finally:
-        # --- 5. Cleanup ---
+        # --- 3. Cleanup ---
         logger.info("--- Cleaning up resources ---")
-        # Clean up downloaded PDFs (optional, could be kept for debugging)
-        # pdf_files = list(PDF_STORAGE_PATH.glob("*.pdf"))
-        # if pdf_files:
-        #     logger.info(f"Removing {len(pdf_files)} downloaded PDF files...")
-        #     for pdf_file in pdf_files:
-        #         try:
-        #             os.remove(pdf_file)
-        #         except OSError as e:
-        #             logger.warning(f"Could not remove PDF file {pdf_file}: {e}")
         # Close Redis pool
         await close_redis_pool()
         logger.info("--- Pipeline Run Complete ---")
